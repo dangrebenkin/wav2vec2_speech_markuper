@@ -1,8 +1,10 @@
+import os
 import io
 import re
 import torch
 import torchaudio
 import numpy as np
+from speech_aligner import SpeechAligner
 from separator_energy_minimums import SeparatorSignalEnergy
 from transformers import Wav2Vec2ProcessorWithLM, Wav2Vec2ForCTC
 
@@ -10,6 +12,7 @@ from transformers import Wav2Vec2ProcessorWithLM, Wav2Vec2ForCTC
 class SpeechMarkuper:
 
     def __init__(self,
+                 model_path: str,
                  sample_rate: int = 16000):
         self.sample_rate = sample_rate
         self.separator = SeparatorSignalEnergy(sample_rate=sample_rate,
@@ -18,9 +21,13 @@ class SpeechMarkuper:
         self.re_for_annotation = re.compile(r'^[аоуыэяеёюибвгдйжзклмнпрстфхцчшщьъ\s]+$')
         # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device('cpu')
-        self.processor_with_lm = Wav2Vec2ProcessorWithLM.from_pretrained("bond005/wav2vec2-large-ru-golos-with-lm")
-        self.model = Wav2Vec2ForCTC.from_pretrained("bond005/wav2vec2-large-ru-golos-with-lm").to(self.device)
+        self.processor_with_lm = Wav2Vec2ProcessorWithLM.from_pretrained(model_path)
+        self.model = Wav2Vec2ForCTC.from_pretrained(model_path).to(self.device)
         self.model.eval()
+        self.aligner = SpeechAligner(asr_model=self.model,
+                                     asr_processor=self.processor_with_lm,
+                                     sample_rate=self.sample_rate)
+        self.num_processes = os.cpu_count()
 
     def tensor_normalization(self,
                              input_tensor: torch.tensor) -> torch.tensor:
@@ -56,7 +63,7 @@ class SpeechMarkuper:
             return preprocessed_audio_data
 
         preprocessed_audio_data = self.tensor_normalization(preprocessed_audio_data)
-        transform = torchaudio.transforms.Resample(defined_sample_rate, 16000)
+        transform = torchaudio.transforms.Resample(defined_sample_rate, self.sample_rate)
         preprocessed_audio_data = transform(preprocessed_audio_data)
         preprocessed_audio_data = torch.squeeze(preprocessed_audio_data, 0)
         preprocessed_audio_data = np.asarray(preprocessed_audio_data.numpy(), dtype=np.float32)
@@ -83,29 +90,11 @@ class SpeechMarkuper:
         return final_annotation
 
     def speech_recognition(self,
-                           batch: list,
-                           one_file=False):
+                           batch):
         markups = []
-        inputs = self.processor_with_lm(batch,
-                                        feature_size=len(batch),
-                                        sampling_rate=self.sample_rate,
-                                        return_tensors="pt",
-                                        padding=True).to(self.device)
-        with torch.no_grad():
-            print(inputs.input_values)
-            print(inputs.input_values.shape)
-            logits = self.model(inputs.input_values,
-                                attention_mask=inputs.attention_mask).logits
-
-        if one_file:
-            final_logits = logits[0].cpu().numpy()
-            for logit in logits[1::]:
-                logit = logit.cpu().numpy()
-                final_logits = np.concatenate((final_logits, logit), axis=0)
-
-        final_logits = logits.cpu().numpy()
-        results = self.processor_with_lm.batch_decode(logits=final_logits,
-                                                      output_word_offsets=True)
+        results = self.processor_with_lm.batch_decode(logits=batch,
+                                                      output_word_offsets=True,
+                                                      num_processes=self.num_processes)
         time_offset = self.model.config.inputs_to_logits_ratio / self.sample_rate
         for file_offset in results.word_offsets:
             word_offsets = [
@@ -115,14 +104,15 @@ class SpeechMarkuper:
                     "end_time": round(d["end_offset"] * time_offset, 2)
                 }
                 for d in file_offset]
-            for offset in word_offsets:
-                markups.append(offset)
-            return markups
+            markups.append(word_offsets)
+        return markups
 
     def get_markup(self,
                    wav_sample_rate: int = 16000,
                    wav_data=None,
                    annotation_data=None):
+
+        annotation_data_is_good_input = False
 
         prepared_audio_data = []
         if wav_data is None:
@@ -150,25 +140,8 @@ class SpeechMarkuper:
             else:
                 audio_batch.append(prepared_audio_wav)
 
-        if annotation_data is None:
-            audio_markups = list(0 for _ in range(0, len(audio_batch)))
-            audio_batch_indices = list(i for i in range(0, len(audio_batch)))
-            separated_audio_indices = [audio_batch.index(i) for i in audio_batch if type(i).__name__ == 'list']
-            if len(separated_audio_indices) > 0:
-                not_separated_audio_indices = [x for x in audio_batch_indices if x not in separated_audio_indices]
-                not_separated_audio = [audio_batch[i] for i in not_separated_audio_indices]
-                not_separated_audio_markups = self.speech_recognition(not_separated_audio)
-                for not_separated_audio_index, not_separated_audio_markup in zip(not_separated_audio_indices,
-                                                                                 not_separated_audio_markups):
-                    audio_markups[not_separated_audio_index] = not_separated_audio_markup
-                for separated_audio_index in separated_audio_indices:
-                    separated_audio_markup = self.speech_recognition(audio_batch[separated_audio_index],
-                                                                     one_file=True)
-                    audio_markups[separated_audio_index] = separated_audio_markup
-            else:
-                audio_markups = self.speech_recognition(audio_batch)
-            return audio_markups
-        else:
+        prepared_annotation_data = []
+        if annotation_data is not None:
             if type(annotation_data).__name__ == 'list':
                 prepared_annotation_data = [self.input_annotation_data_preprocessing(i) for i in annotation_data]
             elif type(annotation_data).__name__ == 'str':
@@ -182,3 +155,55 @@ class SpeechMarkuper:
                 length_error = (f'Annotations batch length ({len(prepared_annotation_data)}) is not equal to '
                                 f'audio batch length ({len(prepared_audio_data)}) ')
                 return length_error
+            annotation_data_is_good_input = True
+
+        audio_logits = list(0 for _ in range(0, len(audio_batch)))
+        processed_files = list(0 for _ in range(0, len(audio_batch)))
+        audio_batch_indices = list(i for i in range(0, len(audio_batch)))
+        separated_audio_indices = [audio_batch.index(i) for i in audio_batch if type(i).__name__ == 'list']
+        not_separated_audio_indices = [i for i in audio_batch_indices if i not in separated_audio_indices]
+
+        if len(separated_audio_indices) > 0:
+            separated_audio = [audio_batch[i] for i in separated_audio_indices]
+            for seped_file, seped_file_index in zip(separated_audio, separated_audio_indices):
+                processed = self.processor_with_lm(seped_file,
+                                                   sampling_rate=self.sample_rate,
+                                                   return_tensors="pt",
+                                                   padding="longest")
+
+                with torch.no_grad():
+                    seped_file = self.model(processed.input_values,
+                                            attention_mask=processed.attention_mask).logits
+                seped_file_logits = seped_file[0].cpu().numpy()
+                for logit in seped_file[1::]:
+                    logit = logit.cpu().numpy()
+                    seped_file_logits = np.concatenate((seped_file_logits, logit), axis=0)
+
+                # надо как-то объединить !!!!!!!!!!!!
+                processed_files[seped_file_index] = processed
+
+                audio_logits[seped_file_index] = seped_file_logits
+
+        if len(not_separated_audio_indices) > 0:
+            not_separated_audio = [audio_batch[i] for i in not_separated_audio_indices]
+            for not_seped_file, not_seped_file_index in zip(not_separated_audio, not_separated_audio_indices):
+                processed = self.processor_with_lm(not_seped_file,
+                                                   sampling_rate=self.sample_rate,
+                                                   return_tensors="pt",
+                                                   padding="longest")
+                print(processed)
+                processed_files[not_seped_file_index] = processed
+                with torch.no_grad():
+                    not_seped_file_logits = self.model(processed.input_values,
+                                                       attention_mask=processed.attention_mask).logits
+                audio_logits[not_seped_file_index] = not_seped_file_logits
+        audio_logits = torch.stack(audio_logits, 0).cpu().numpy()
+
+        if annotation_data_is_good_input:
+            audio_markups = self.aligner.forced_alignment(logits=audio_logits,
+                                                          processed_files=processed_files,
+                                                          texts=prepared_annotation_data)
+        else:
+            audio_markups = self.speech_recognition(batch=audio_logits)
+
+        return audio_markups
