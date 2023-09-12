@@ -1,10 +1,12 @@
 # based on https://pytorch.org/audio/main/tutorials/forced_alignment_tutorial.html
 import nltk
+import numpy
 import torch
 import numpy as np
 from typing import List
 from dataclasses import dataclass
-from transformers import Wav2Vec2ProcessorWithLM, Wav2Vec2ForCTC
+from transformers import (Wav2Vec2ProcessorWithLM, Wav2Vec2ForCTC,
+                          Pipeline)
 
 
 @dataclass
@@ -133,72 +135,88 @@ class SpeechAligner:
         return words
 
     def forced_alignment(self,
-                         processed_files: list,
-                         logits: torch.tensor,
+                         audio,
+                         pipeline: Pipeline,
                          texts: list):
+        forced_alignment_markups = []
+        pipeline.feature_extractor.sampling_rate = self.sample_rate
+        processed_files = [pipeline.preprocess(inputs=i,
+                                               chunk_length_s=30,
+                                               stride_length_s=(5, 5))
+                           for i in audio]
+        for processed_one_file in processed_files:
+            print(processed_one_file)
+            processed = {'input_values': torch.stack([i.input_values for i in processed_one_file], 0),
+                         'attention_mask': torch.stack([i.attention_mask for i in processed_one_file], 0)}
+            print(processed)
+            with torch.no_grad():
+                logits = self.model(processed.input_values, attention_mask=processed.attention_mask).logits
+            final_logits = logits[0].cpu().numpy()
+            for logit in logits[1::]:
+                logit = logit.cpu().numpy()
+                final_logits = numpy.concatenate((final_logits, logit), axis=0)
 
-        processed_files
+            feat_extract_output_lengths = self.model._get_feat_extract_output_lengths(
+                processed.attention_mask.sum(dim=1)).numpy()
+            true_texts_in_batch = [
+                ' '.join(
+                    list(filter(lambda it: it.isalpha(), nltk.wordpunct_tokenize(cur)))
+                ).lower().replace('ё', 'е')
+                for cur in texts
+            ]
+            del processed
 
-        feat_extract_output_lengths = self.model._get_feat_extract_output_lengths(
-            processed.attention_mask.sum(dim=1)).numpy()
-        true_texts_in_batch = [
-            ' '.join(
-                list(filter(lambda it: it.isalpha(), nltk.wordpunct_tokenize(cur)))
-            ).lower().replace('ё', 'е')
-            for cur in texts
-        ]
-        del processed
+            """get emission matrices"""
+            with self.processor.as_target_processor():
+                processed = self.processor(true_texts_in_batch,
+                                           padding='longest',
+                                           return_tensors='pt')
+            emission_matrices = []
+            for sample_idx in range(feat_extract_output_lengths.shape[0]):
+                specgram_len = feat_extract_output_lengths[sample_idx]
+                new_emission_matrix = torch.log_softmax(
+                    logits[sample_idx, 0:specgram_len],
+                    dim=-1
+                ).numpy()
+                assert len(new_emission_matrix.shape) == 2
+                assert new_emission_matrix.shape[0] == specgram_len
+                emission_matrices.append(new_emission_matrix)
 
-        """get emission matrices"""
-        with self.processor.as_target_processor():
-            processed = self.processor(true_texts_in_batch,
-                                       padding='longest',
-                                       return_tensors='pt')
-        emission_matrices = []
-        for sample_idx in range(feat_extract_output_lengths.shape[0]):
-            specgram_len = feat_extract_output_lengths[sample_idx]
-            new_emission_matrix = torch.log_softmax(
-                logits[sample_idx, 0:specgram_len],
-                dim=-1
-            ).numpy()
-            assert len(new_emission_matrix.shape) == 2
-            assert new_emission_matrix.shape[0] == specgram_len
-            emission_matrices.append(new_emission_matrix)
+            """get labels"""
+            labels_ = processed.input_ids.masked_fill(
+                processed.attention_mask.ne(1),
+                -100
+            )
+            del processed
+            labels_ = labels_.numpy()
+            labels = []
+            for sample_idx in range(labels_.shape[0]):
+                new_label_list = []
+                for token_idx in range(labels_.shape[1]):
+                    if labels_[sample_idx, token_idx] < 0:
+                        break
+                    new_label_list.append(int(labels_[sample_idx, token_idx]))
+                labels.append(new_label_list)
+                del new_label_list
+            del labels_
 
-        """get labels"""
-        labels_ = processed.input_ids.masked_fill(
-            processed.attention_mask.ne(1),
-            -100
-        )
-        del processed
-        labels_ = labels_.numpy()
-        labels = []
-        for sample_idx in range(labels_.shape[0]):
-            new_label_list = []
-            for token_idx in range(labels_.shape[1]):
-                if labels_[sample_idx, token_idx] < 0:
-                    break
-                new_label_list.append(int(labels_[sample_idx, token_idx]))
-            labels.append(new_label_list)
-            del new_label_list
-        del labels_
-
-        """get markups"""
-        counter = 0
-        fa_markup_result = []
-        for i, j in zip(emission_matrices, labels):
-            segments_for_file, trellis_shape_for_ratio = self.get_segments(i, j)
-            ratio = audios[counter].shape[0] / (trellis_shape_for_ratio - 1)
-            list_of_bounds = []
-            word_segments = self.merge_words(segments_for_file)
-            for segment in word_segments:
-                start = segment.start * ratio / self.sample_rate
-                end = segment.end * ratio / self.sample_rate
-                bounds = {
-                    "word": segment.label,
-                    "start_time": start,
-                    "end_time": end
-                }
-                list_of_bounds.append(bounds)
-            fa_markup_result.append(list_of_bounds)
-        return fa_markup_result
+            """get markups"""
+            counter = 0
+            fa_markup_result = []
+            for i, j in zip(emission_matrices, labels):
+                segments_for_file, trellis_shape_for_ratio = self.get_segments(i, j)
+                ratio = processed.input_values[counter].shape[0] / (trellis_shape_for_ratio - 1)
+                list_of_bounds = []
+                word_segments = self.merge_words(segments_for_file)
+                for segment in word_segments:
+                    start = segment.start * ratio / self.sample_rate
+                    end = segment.end * ratio / self.sample_rate
+                    bounds = {
+                        "word": segment.label,
+                        "start_time": start,
+                        "end_time": end
+                    }
+                    list_of_bounds.append(bounds)
+                fa_markup_result.append(list_of_bounds)
+            forced_alignment_markups.append(fa_markup_result)
+        return forced_alignment_markups
