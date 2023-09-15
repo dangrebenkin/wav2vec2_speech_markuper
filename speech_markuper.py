@@ -17,7 +17,8 @@ class SpeechMarkuper:
         self.sample_rate = sample_rate
         self.num_processes = os.cpu_count()
         self.re_for_annotation = re.compile(r'^[аоуыэяеёюибвгдйжзклмнпрстфхцчшщьъ\s]+$')
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device('cpu')
         self.processor_with_lm = Wav2Vec2ProcessorWithLM.from_pretrained(model_path)
         self.model = Wav2Vec2ForCTC.from_pretrained(model_path).to(self.device)
         self.model.eval()

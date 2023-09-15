@@ -144,26 +144,33 @@ class SpeechAligner:
                                                chunk_length_s=30,
                                                stride_length_s=(5, 5))
                            for i in audio]
+        counter = 0
         for processed_one_file in processed_files:
-            print(processed_one_file)
-            processed = {'input_values': torch.stack([i.input_values for i in processed_one_file], 0),
-                         'attention_mask': torch.stack([i.attention_mask for i in processed_one_file], 0)}
-            print(processed)
-            with torch.no_grad():
-                logits = self.model(processed.input_values, attention_mask=processed.attention_mask).logits
-            final_logits = logits[0].cpu().numpy()
-            for logit in logits[1::]:
-                logit = logit.cpu().numpy()
-                final_logits = numpy.concatenate((final_logits, logit), axis=0)
+            processed = {}
+            first_elem = next(processed_one_file)
+            if first_elem['is_last']:
+                processed = first_elem
+                with torch.no_grad():
+                    logits = pipeline.model(processed['input_values'],
+                                            attention_mask=processed['attention_mask']).logits
+            else:
+                data = [(i['attention_mask'], i['input_values']) for i in processed_one_file]
+                attention_masks = [i[0] for i in data]
+                input_values_list = [i[1] for i in data]
+                final_attention_mask = torch.cat(attention_masks, 1)
+                processed['attention_mask'] = final_attention_mask
+                all_logits = []
+                for i, j in zip(attention_masks, input_values_list):
+                    with torch.no_grad():
+                        temp_logits = pipeline.model(j,
+                                                     attention_mask=i)
+                        all_logits.append(temp_logits.logits)
+                logits = torch.cat(all_logits, 1)
+                del data, attention_masks, input_values_list, final_attention_mask
 
             feat_extract_output_lengths = self.model._get_feat_extract_output_lengths(
                 processed.attention_mask.sum(dim=1)).numpy()
-            true_texts_in_batch = [
-                ' '.join(
-                    list(filter(lambda it: it.isalpha(), nltk.wordpunct_tokenize(cur)))
-                ).lower().replace('ё', 'е')
-                for cur in texts
-            ]
+            true_texts_in_batch = texts[counter]
             del processed
 
             """get emission matrices"""
@@ -172,15 +179,15 @@ class SpeechAligner:
                                            padding='longest',
                                            return_tensors='pt')
             emission_matrices = []
-            for sample_idx in range(feat_extract_output_lengths.shape[0]):
-                specgram_len = feat_extract_output_lengths[sample_idx]
-                new_emission_matrix = torch.log_softmax(
-                    logits[sample_idx, 0:specgram_len],
-                    dim=-1
-                ).numpy()
-                assert len(new_emission_matrix.shape) == 2
-                assert new_emission_matrix.shape[0] == specgram_len
-                emission_matrices.append(new_emission_matrix)
+            # for sample_idx in range(feat_extract_output_lengths.shape[0]):
+            specgram_len = feat_extract_output_lengths[sample_idx]
+            new_emission_matrix = torch.log_softmax(
+                logits[sample_idx, 0:specgram_len],
+                dim=-1
+            ).numpy()
+            assert len(new_emission_matrix.shape) == 2
+            assert new_emission_matrix.shape[0] == specgram_len
+            emission_matrices.append(new_emission_matrix)
 
             """get labels"""
             labels_ = processed.input_ids.masked_fill(
