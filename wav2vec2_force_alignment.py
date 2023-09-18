@@ -129,13 +129,13 @@ def generator_data_to_batch(generator):
             all_logits[-1] = torch.concat((all_logits[-1], tensor_to_pad_logit), 1)
 
             difference_mask = attention_masks[0].shape[1] - attention_masks[-1].shape[1]
-            tensor_to_pad_mask = torch.zeros(1, difference_mask)
-            attention_masks[-1] = torch.concat((attention_masks[-1], tensor_to_pad_mask), 1)
+            if difference_mask > 0:
+                tensor_to_pad_mask = torch.zeros(1, difference_mask)
+                attention_masks[-1] = torch.concat((attention_masks[-1], tensor_to_pad_mask), 1)
 
             all_logits = [torch.squeeze(i, 0) for i in all_logits]
             final_logits = torch.concat(all_logits)
             final_logits = torch.unsqueeze(final_logits, 0)
-
             final_attention_mask = torch.concat(attention_masks, 1).to(torch.int32)
 
         return final_logits, final_attention_mask

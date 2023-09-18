@@ -1,9 +1,10 @@
+import gc
 import os
 import io
 import re
 import torch
 import numpy as np
-from speech_aligner import SpeechAligner
+from forced_alignment_utils import ForcedAlignmentUtils
 from transformers.pipelines.pt_utils import PipelineIterator
 from transformers import pipeline, Wav2Vec2ProcessorWithLM, Wav2Vec2ForCTC
 
@@ -30,9 +31,7 @@ class SpeechMarkuper:
             framework='pt',
             device=self.device,
             batch_size=batch_size)
-        self.aligner = SpeechAligner(asr_model=self.model,
-                                     asr_processor=self.processor_with_lm,
-                                     sample_rate=self.sample_rate)
+        self.fa_utils = ForcedAlignmentUtils()
 
     def check_audio_data_input_type(self,
                                     input_data):
@@ -82,6 +81,46 @@ class SpeechMarkuper:
                 all_parts.append(final_markup)
         return all_parts
 
+    def generator_data_to_batch(self,
+                                generator):
+        first_element = next(generator)
+        input_data_length = 0
+        if first_element['is_last']:
+            input_data_length = first_element['input_values'].shape[1]
+            with torch.no_grad():
+                wav_logits = self.model(first_element['input_values'],
+                                        attention_mask=first_element['attention_mask']).logits
+            return first_element['attention_mask'], wav_logits, input_data_length
+        elif first_element['is_last'] is not True:
+            attention_masks = [first_element['attention_mask']]
+            input_data_length += first_element['input_values'].shape[1]
+            all_logits = []
+            with torch.no_grad():
+                wav_logits = self.model(first_element['input_values'],
+                                        attention_mask=first_element['attention_mask']).logits
+                all_logits.append(wav_logits)
+                for next_element in generator:
+                    input_data_length += next_element['input_values'].shape[1]
+                    wav_logits = self.model(next_element['input_values'],
+                                            attention_mask=next_element['attention_mask']).logits
+                    all_logits.append(wav_logits)
+                    attention_masks.append(next_element['attention_mask'])
+                difference_logit = all_logits[0].shape[1] - all_logits[-1].shape[1]
+                tensor_to_pad_logit = torch.zeros(1, difference_logit, all_logits[0].shape[2])
+                all_logits[-1] = torch.concat((all_logits[-1], tensor_to_pad_logit), 1)
+
+                difference_mask = attention_masks[0].shape[1] - attention_masks[-1].shape[1]
+                if difference_mask > 0:
+                    tensor_to_pad_mask = torch.zeros(1, difference_mask)
+                    attention_masks[-1] = torch.concat((attention_masks[-1], tensor_to_pad_mask), 1)
+
+                all_logits = [torch.squeeze(i, 0) for i in all_logits]
+                final_logits = torch.concat(all_logits)
+                final_logits = torch.unsqueeze(final_logits, 0)
+                final_attention_mask = torch.concat(attention_masks, 1).to(torch.int32)
+
+            return final_logits, final_attention_mask, input_data_length
+
     def get_markup(self,
                    wav_data=None,
                    annotation_data=None):
@@ -126,10 +165,78 @@ class SpeechMarkuper:
             annotation_data_is_good_input = True
 
         final_markups = []
+
+        # forced alignment
         if annotation_data_is_good_input:
-            final_markups = self.aligner.forced_alignment(audio=prepared_audio_data,
-                                                          texts=prepared_annotation_data,
-                                                          pipeline=self.asr_pipeline)
+            if type(prepared_audio_data).__name__ != 'list':
+                prepared_audio_data = [prepared_audio_data]
+
+            for audiodata, textdata in zip(prepared_audio_data, prepared_annotation_data):
+                audiodata = self.asr_pipeline.preprocess(inputs=audiodata,
+                                                         chunk_length_s=5,
+                                                         stride_length_s=(1, 1))
+                (audiodata_logits,
+                 audiodata_attention_mask,
+                 audiodata_length) = self.generator_data_to_batch(audiodata)
+                del audiodata
+                output_lengths = (
+                    self.model._get_feat_extract_output_lengths(audiodata_attention_mask.sum(dim=1)).numpy())
+                emission_matrices = []
+                for sample_idx in range(output_lengths.shape[0]):
+                    specgram_len = output_lengths[sample_idx]
+                    new_emission_matrix = torch.log_softmax(
+                        audiodata_logits[sample_idx, 0:specgram_len],
+                        dim=-1
+                    ).numpy()
+                    assert len(new_emission_matrix.shape) == 2
+                    assert new_emission_matrix.shape[0] == specgram_len
+                    emission_matrices.append(new_emission_matrix)
+                print(len(emission_matrices))
+                del audiodata_logits, audiodata_attention_mask, specgram_len, output_lengths
+
+                with self.processor_with_lm.as_target_processor():
+                    processed = self.processor_with_lm([textdata],
+                                                       padding='longest',
+                                                       return_tensors='pt')
+                del textdata
+                labels_ = processed.input_ids.masked_fill(processed.attention_mask.ne(1), -100)
+                labels_ = labels_.numpy()
+                labels = []
+                for sample_idx in range(labels_.shape[0]):
+                    new_label_list = []
+                    for token_idx in range(labels_.shape[1]):
+                        if labels_[sample_idx, token_idx] < 0:
+                            break
+                        new_label_list.append(int(labels_[sample_idx, token_idx]))
+                    labels.append(new_label_list)
+                    del new_label_list
+                del labels_
+                trellis = self.fa_utils.get_trellis(emission_matrices[0], labels[0])
+                trellis_shape = trellis.shape[0]
+                path = self.fa_utils.backtrack(trellis, emission_matrices[0], labels[0])
+                del trellis, emission_matrices
+                segments = (self.fa_utils.merge_repeats
+                            (path=path,
+                             tokenized=self.processor_with_lm.tokenizer.convert_ids_to_tokens(labels[0],
+                                                                                              skip_special_tokens=False)
+                             ))
+                del labels, path
+                ratio = audiodata_length / (trellis_shape - 1)
+                audio_markups = []
+                word_segments = self.fa_utils.merge_words(segments)
+                for segment in word_segments:
+                    start = segment.start * ratio / self.sample_rate
+                    end = segment.end * ratio / self.sample_rate
+                    bounds = {
+                        "word": segment.label,
+                        "start_time": start,
+                        "end_time": end
+                    }
+                    audio_markups.append(bounds)
+                final_markups.append(audio_markups)
+                gc.collect()
+
+        # speech recognition
         else:
             audio_markups = self.asr_pipeline(prepared_audio_data,
                                               return_timestamps='word',
