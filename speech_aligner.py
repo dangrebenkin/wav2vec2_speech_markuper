@@ -169,20 +169,20 @@ class SpeechAligner:
                 del data, attention_masks, input_values_list, final_attention_mask
 
             feat_extract_output_lengths = self.model._get_feat_extract_output_lengths(
-                processed.attention_mask.sum(dim=1)).numpy()
+                processed['attention_mask'].sum(dim=1)).numpy()
             true_texts_in_batch = texts[counter]
             del processed
 
             """get emission matrices"""
             with self.processor.as_target_processor():
-                processed = self.processor(true_texts_in_batch,
+                processed = self.processor([true_texts_in_batch],
                                            padding='longest',
                                            return_tensors='pt')
             emission_matrices = []
-            # for sample_idx in range(feat_extract_output_lengths.shape[0]):
-            specgram_len = feat_extract_output_lengths[sample_idx]
+            print(feat_extract_output_lengths)
+            specgram_len = feat_extract_output_lengths[0]
             new_emission_matrix = torch.log_softmax(
-                logits[sample_idx, 0:specgram_len],
+                logits[0],
                 dim=-1
             ).numpy()
             assert len(new_emission_matrix.shape) == 2
@@ -210,9 +210,9 @@ class SpeechAligner:
             """get markups"""
             counter = 0
             fa_markup_result = []
-            for i, j in zip(emission_matrices, labels):
+            for i, j in zip(emission_matrices[0], labels[0]):
                 segments_for_file, trellis_shape_for_ratio = self.get_segments(i, j)
-                ratio = processed.input_values[counter].shape[0] / (trellis_shape_for_ratio - 1)
+                ratio = processed.input_values.shape[0] / (trellis_shape_for_ratio - 1)
                 list_of_bounds = []
                 word_segments = self.merge_words(segments_for_file)
                 for segment in word_segments:
