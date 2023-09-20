@@ -74,8 +74,6 @@ class W2V2SpeechMarkuper:
         elif type(input_data).__name__ == 'ndarray':
             wav_data = np.float32(input_data)
             return wav_data
-        elif type(input_data).__name__ == 'bytes':
-            return input_data
         else:
             return False
 
@@ -176,7 +174,7 @@ class W2V2SpeechMarkuper:
                 return 'Empty list!'
         else:
             check_type = self.check_audio_data_input_type(wav_data)
-            if check_type:
+            if check_type is not False:
                 prepared_audio_data_length = 1
                 prepared_audio_data = wav_data
             else:

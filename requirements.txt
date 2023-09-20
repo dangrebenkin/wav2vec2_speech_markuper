@@ -1,0 +1,4 @@
+torch>=2.0.1
+jiwer>=3.0.3
+numpy>=1.24.4
+transformers>=4.33.1
