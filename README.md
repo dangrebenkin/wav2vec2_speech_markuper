@@ -5,7 +5,7 @@ Automatic generation of speech dataset markup with use of Wav2Vec2 ASR models.
 
 ```
 git clone https://github.com/dangrebenkin/wav2vec2_speech_markuper
-cd audio_augmentator
+cd wav2vec2_speech_markuper
 python setup.py install
 ```
 ### Usage steps
