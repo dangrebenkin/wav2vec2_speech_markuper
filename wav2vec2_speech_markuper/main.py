@@ -271,8 +271,8 @@ class W2V2SpeechMarkuper:
         else:
             audio_markups = self.asr_pipeline(prepared_audio_data,
                                               return_timestamps='word',
-                                              chunk_length_s=8,
-                                              stride_length_s=(1, 1))
+                                              chunk_length_s=self.chunk_length_for_long_audio_s,
+                                              stride_length_s=self.chunk_stride_length_s)
 
             if type(audio_markups).__name__ == 'PipelineIterator':
                 if prepared_audio_data_length == 1:
