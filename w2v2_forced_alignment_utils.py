@@ -25,7 +25,7 @@ class Segment:
         return self.end - self.start
 
 
-class ForcedAlignmentUtils:
+class W2V2ForcedAlignmentUtils:
 
     def merge_repeats(self,
                       path: List[Point],
