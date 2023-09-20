@@ -1,4 +1,4 @@
-from w2v2_speech_markuper import W2V2SpeechMarkuper
+from wav2vec2_speech_markuper.markuper import W2V2SpeechMarkuper
 
 audio_markuper = W2V2SpeechMarkuper(model_path='bond005/wav2vec2-large-ru-golos-with-lm',
                                     w2v2_ctc_model_with_lm=True,
