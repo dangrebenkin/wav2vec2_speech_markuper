@@ -7,7 +7,7 @@ import jiwer
 import numpy as np
 import jiwer.transforms as tr
 from typing import List
-from w2v2_forced_alignment_utils import W2V2ForcedAlignmentUtils
+from utils import W2V2ForcedAlignmentUtils
 from transformers.pipelines.pt_utils import PipelineIterator
 from transformers import pipeline, Wav2Vec2ProcessorWithLM, Wav2Vec2ForCTC, Wav2Vec2Processor
 
